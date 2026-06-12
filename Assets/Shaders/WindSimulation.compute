@@ -1,0 +1,152 @@
+#pragma kernel Advection
+#pragma kernel Diffusion
+#pragma kernel ComputeDivergence
+#pragma kernel PressureSolve
+#pragma kernel PressureGradientSubtract
+#pragma kernel ApplyBoundaryConditions
+#pragma kernel CopyField
+
+#define N 512
+#define THREADS 16
+
+float2 _InvGridSize;
+float _Dt;
+float _Viscosity;
+float _Dissipation;
+int _PressureIterations;
+
+RWTexture2D<float2> _Velocity;
+RWTexture2D<float2> _VelocityPrev;
+RWTexture2D<float> _Pressure;
+RWTexture2D<float> _PressurePrev;
+RWTexture2D<float> _Divergence;
+
+float2 SampleVelocity(RWTexture2D<float2> field, int2 id)
+{
+    if (id.x < 0 || id.x >= N || id.y < 0 || id.y >= N)
+        return float2(0, 0);
+    return field[id];
+}
+
+[numthreads(THREADS, THREADS, 1)]
+void Advection(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= N || id.y >= N) return;
+
+    float2 pos = float2(id.x, id.y);
+    float2 vel = _VelocityPrev[id];
+    float2 backPos = pos - _Dt * vel * (N - 1);
+    backPos = clamp(backPos, float2(0.5, 0.5), float2(N - 1.5, N - 1.5));
+
+    int2 p0 = int2(floor(backPos));
+    int2 p1 = p0 + int2(1, 1);
+    p0 = clamp(p0, int2(0, 0), int2(N - 1, N - 1));
+    p1 = clamp(p1, int2(0, 0), int2(N - 1, N - 1));
+
+    float2 f = backPos - floor(backPos);
+
+    float2 v00 = _VelocityPrev[p0];
+    float2 v10 = _VelocityPrev[int2(p1.x, p0.y)];
+    float2 v01 = _VelocityPrev[int2(p0.x, p1.y)];
+    float2 v11 = _VelocityPrev[p1];
+
+    float2 result = lerp(lerp(v00, v10, f.x), lerp(v01, v11, f.x), f.y);
+    _Velocity[id.xy] = result * _Dissipation;
+}
+
+[numthreads(THREADS, THREADS, 1)]
+void Diffusion(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= N || id.y >= N) return;
+
+    float2 center = _VelocityPrev[id.xy];
+    float2 left   = SampleVelocity(_VelocityPrev, int2(id.x - 1, id.y));
+    float2 right  = SampleVelocity(_VelocityPrev, int2(id.x + 1, id.y));
+    float2 bottom = SampleVelocity(_VelocityPrev, int2(id.x, id.y - 1));
+    float2 top    = SampleVelocity(_VelocityPrev, int2(id.x, id.y + 1));
+
+    float2 laplacian = left + right + bottom + top - 4.0 * center;
+    _Velocity[id.xy] = center + _Viscosity * _Dt * laplacian;
+}
+
+[numthreads(THREADS, THREADS, 1)]
+void ComputeDivergence(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= N || id.y >= N) return;
+
+    float2 left   = SampleVelocity(_Velocity, int2(id.x - 1, id.y));
+    float2 right  = SampleVelocity(_Velocity, int2(id.x + 1, id.y));
+    float2 bottom = SampleVelocity(_Velocity, int2(id.x, id.y - 1));
+    float2 top    = SampleVelocity(_Velocity, int2(id.x, id.y + 1));
+
+    float div = 0.5 * ((right.x - left.x) + (top.y - bottom.y));
+    _Divergence[id.xy] = div;
+}
+
+[numthreads(THREADS, THREADS, 1)]
+void PressureSolve(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= N || id.y >= N) return;
+
+    float pCenter = _PressurePrev[id.xy];
+    float pLeft   = (id.x > 0)     ? _PressurePrev[int2(id.x - 1, id.y)] : pCenter;
+    float pRight  = (id.x < N - 1) ? _PressurePrev[int2(id.x + 1, id.y)] : pCenter;
+    float pBottom = (id.y > 0)     ? _PressurePrev[int2(id.x, id.y - 1)] : pCenter;
+    float pTop    = (id.y < N - 1) ? _PressurePrev[int2(id.x, id.y + 1)] : pCenter;
+
+    float div = _Divergence[id.xy];
+    _Pressure[id.xy] = (pLeft + pRight + pBottom + pTop - div) * 0.25;
+}
+
+[numthreads(THREADS, THREADS, 1)]
+void PressureGradientSubtract(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= N || id.y >= N) return;
+
+    float pLeft   = (id.x > 0)     ? _Pressure[int2(id.x - 1, id.y)] : _Pressure[id.xy];
+    float pRight  = (id.x < N - 1) ? _Pressure[int2(id.x + 1, id.y)] : _Pressure[id.xy];
+    float pBottom = (id.y > 0)     ? _Pressure[int2(id.x, id.y - 1)] : _Pressure[id.xy];
+    float pTop    = (id.y < N - 1) ? _Pressure[int2(id.x, id.y + 1)] : _Pressure[id.xy];
+
+    float2 gradP = 0.5 * float2(pRight - pLeft, pTop - pBottom);
+    _Velocity[id.xy] = _Velocity[id.xy] - gradP;
+}
+
+[numthreads(THREADS, THREADS, 1)]
+void ApplyBoundaryConditions(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= N || id.y >= N) return;
+
+    float2 vel = _Velocity[id.xy];
+
+    if (id.x == 0)
+    {
+        vel.x = 10.0;
+        vel.y = vel.y * 0.95;
+    }
+    else if (id.x == N - 1)
+    {
+        vel.x = _Velocity[int2(id.x - 1, id.y)].x;
+        vel.y = _Velocity[int2(id.x - 1, id.y)].y;
+    }
+
+    if (id.y == 0)
+    {
+        vel.y = abs(vel.y);
+    }
+    else if (id.y == N - 1)
+    {
+        vel.y = -abs(vel.y);
+    }
+
+    _Velocity[id.xy] = vel;
+    _Pressure[id.xy] = 0.0;
+}
+
+[numthreads(THREADS, THREADS, 1)]
+void CopyField(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= N || id.y >= N) return;
+    _VelocityPrev[id.xy] = _Velocity[id.xy];
+    _PressurePrev[id.xy] = _Pressure[id.xy];
+}
