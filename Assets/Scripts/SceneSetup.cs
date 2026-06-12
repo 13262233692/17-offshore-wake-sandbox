@@ -18,7 +18,9 @@ public class SceneSetup : MonoBehaviour
     [Header("References (Auto-assigned)")]
     public ComputeShader windSimShader;
     public ComputeShader turbineSrcShader;
+    public ComputeShader aeroForceShader;
     public Shader windVizShader;
+    public Shader bladeDeflectionShader;
 
     private GameObject _ocean;
     private GameObject _windFieldQuad;
@@ -128,6 +130,19 @@ public class SceneSetup : MonoBehaviour
         rotorHub.transform.SetParent(turbineRoot.transform);
         rotorHub.transform.localPosition = new Vector3(3f, hubHeight, 0f);
 
+        Material bladeMatInstance = null;
+        if (bladeDeflectionShader != null)
+        {
+            bladeMatInstance = new Material(bladeDeflectionShader);
+            bladeMatInstance.SetFloat("_BladeLength", rotorDiameter * 0.5f);
+            bladeMatInstance.SetFloat("_ChordRoot", 4.5f);
+            bladeMatInstance.SetFloat("_ChordTip", 1.2f);
+            bladeMatInstance.SetFloat("_BladeThickness", 0.8f);
+            bladeMatInstance.SetFloat("_TwistRoot", 12.0f);
+            bladeMatInstance.SetFloat("_TwistTip", -3.0f);
+        }
+
+        GameObject[] blades = new GameObject[3];
         for (int b = 0; b < 3; b++)
         {
             GameObject blade = GameObject.CreatePrimitive(PrimitiveType.Cube);
@@ -136,16 +151,31 @@ public class SceneSetup : MonoBehaviour
             blade.transform.localRotation = Quaternion.Euler(0f, 0f, b * 120f);
             blade.transform.localScale = new Vector3(1f, rotorDiameter * 0.5f, 0.3f);
             blade.transform.localPosition = blade.transform.up * rotorDiameter * 0.25f;
-            blade.GetComponent<Renderer>().material.color = Color.white;
+
+            Renderer bladeRenderer = blade.GetComponent<Renderer>();
+            if (bladeMatInstance != null)
+            {
+                bladeRenderer.material = bladeMatInstance;
+            }
+            else
+            {
+                bladeRenderer.material.color = Color.white;
+            }
+
+            blades[b] = blade;
         }
 
         TurbineController controller = turbineRoot.AddComponent<TurbineController>();
         controller.rotorDiameter = rotorDiameter;
+        controller.bladeLength = rotorDiameter * 0.5f;
         controller.hubHeight = hubHeight;
+        controller.bladesPerRotor = 3;
         controller.thrustCoefficient = 0.8f;
         controller.targetRPM = 12f;
         controller.yawAngleDegrees = 0f;
-        controller.rotorBlade = rotorHub.transform;
+        controller.visualDeflectionScale = 15f;
+        controller.rotorHub = rotorHub.transform;
+        controller.bladeObjects = blades;
 
         return controller;
     }
@@ -162,6 +192,8 @@ public class SceneSetup : MonoBehaviour
             _windManager.windSimulationShader = windSimShader;
         if (turbineSrcShader != null)
             _windManager.turbineSourceShader = turbineSrcShader;
+        if (aeroForceShader != null)
+            _windManager.aerodynamicForceShader = aeroForceShader;
 
         WindFieldRenderer renderer = _windFieldQuad.GetComponent<WindFieldRenderer>();
         if (renderer != null)

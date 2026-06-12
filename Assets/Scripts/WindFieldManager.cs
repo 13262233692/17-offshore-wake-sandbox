@@ -22,6 +22,7 @@ public class WindFieldManager : MonoBehaviour
     [Header("Compute Shaders")]
     public ComputeShader windSimulationShader;
     public ComputeShader turbineSourceShader;
+    public ComputeShader aerodynamicForceShader;
 
     [Header("Turbine Configuration")]
     public TurbineController[] turbines;
@@ -34,6 +35,8 @@ public class WindFieldManager : MonoBehaviour
     private RenderTexture _turbulenceRT;
 
     private ComputeBuffer _turbineDataBuffer;
+    private ComputeBuffer _turbineAeroInputBuffer;
+    private ComputeBuffer _bladeAeroResultBuffer;
 
     private int _advectionKernel;
     private int _diffusionKernel;
@@ -45,9 +48,11 @@ public class WindFieldManager : MonoBehaviour
     private int _copyKernel;
     private int _clampKernel;
     private int _turbineSourceKernel;
+    private int _aeroBladeKernel;
 
     public RenderTexture VelocityTexture => _velocityRT;
     public RenderTexture TurbulenceTexture => _turbulenceRT;
+    public ComputeBuffer BladeAeroResults => _bladeAeroResultBuffer;
 
     [System.NonSerialized]
     public int currentSubSteps;
@@ -118,11 +123,24 @@ public class WindFieldManager : MonoBehaviour
         _clampKernel = windSimulationShader.FindKernel("ClampAndSanitize");
 
         _turbineSourceKernel = turbineSourceShader.FindKernel("ApplyTurbineSources");
+
+        if (aerodynamicForceShader != null)
+        {
+            _aeroBladeKernel = aerodynamicForceShader.FindKernel("ComputeBladeAerodynamics");
+        }
     }
 
     void InitializeBuffers()
     {
         _turbineDataBuffer = new ComputeBuffer(64, System.Runtime.InteropServices.Marshal.SizeOf(typeof(TurbineGPUData)));
+
+        int aeroInputSize = System.Runtime.InteropServices.Marshal.SizeOf(typeof(TurbineGPUData));
+        _turbineAeroInputBuffer = new ComputeBuffer(64, aeroInputSize);
+
+        int sectionFloats = 16;
+        int floatSize = sizeof(float);
+        int bladeAeroStride = 7 * floatSize + sectionFloats * floatSize + sectionFloats * floatSize;
+        _bladeAeroResultBuffer = new ComputeBuffer(64, bladeAeroStride, ComputeBufferType.Default);
     }
 
     void InitializeWindField()
@@ -165,6 +183,7 @@ public class WindFieldManager : MonoBehaviour
         }
 
         UpdateTurbineData();
+        DispatchAerodynamicForceCompute();
 
         float cflScale = ComputeCFLDtScale();
 
@@ -179,6 +198,42 @@ public class WindFieldManager : MonoBehaviour
             ApplyBoundary();
             SanitizeAllFields();
         }
+    }
+
+    void DispatchAerodynamicForceCompute()
+    {
+        if (aerodynamicForceShader == null || turbines == null || turbines.Length == 0) return;
+
+        TurbineGPUData[] aeroInputs = new TurbineGPUData[turbines.Length];
+        for (int i = 0; i < turbines.Length; i++)
+        {
+            if (turbines[i] == null) continue;
+            Vector3 worldPos = turbines[i].transform.position;
+            Vector2 gridPos = WorldToGrid(worldPos);
+
+            aeroInputs[i] = new TurbineGPUData
+            {
+                gridPos = gridPos,
+                rotorRadius = turbines[i].rotorRadiusGrid,
+                thrustCoeff = turbines[i].thrustCoefficient,
+                rpm = turbines[i].currentRPM,
+                yawAngle = turbines[i].yawAngle,
+                _pad0 = 0,
+                _pad1 = 0
+            };
+        }
+        _turbineAeroInputBuffer.SetData(aeroInputs);
+
+        aerodynamicForceShader.SetBuffer(_aeroBladeKernel, "_Turbines", _turbineAeroInputBuffer);
+        aerodynamicForceShader.SetTexture(_aeroBladeKernel, "_Velocity", _velocityRT);
+        aerodynamicForceShader.SetBuffer(_aeroBladeKernel, "_BladeAeroResults", _bladeAeroResultBuffer);
+        aerodynamicForceShader.SetInt("_TurbineCount", turbines.Length);
+        aerodynamicForceShader.SetFloat("_FreeStreamSpeed", freeStreamSpeed);
+        aerodynamicForceShader.SetFloat("_AirDensity", airDensity);
+        aerodynamicForceShader.SetFloat("_Time", Time.time);
+        aerodynamicForceShader.SetFloat("_Rho", airDensity);
+
+        aerodynamicForceShader.Dispatch(_aeroBladeKernel, 64, 1, 1);
     }
 
     void SetCommonParams(float cflScale)
@@ -385,6 +440,10 @@ public class WindFieldManager : MonoBehaviour
 
         if (_turbineDataBuffer != null)
             _turbineDataBuffer.Release();
+        if (_turbineAeroInputBuffer != null)
+            _turbineAeroInputBuffer.Release();
+        if (_bladeAeroResultBuffer != null)
+            _bladeAeroResultBuffer.Release();
     }
 
     void ReleaseRT(RenderTexture rt)

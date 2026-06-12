@@ -1,0 +1,181 @@
+#pragma kernel ComputeBladeAerodynamics
+#pragma kernel SampleTurbineWind
+
+#define N 512
+#define MAX_TURBINES 64
+#define BLADE_SEGMENTS 16
+#define THREADS 16
+
+struct TurbineInput
+{
+    float2 gridPos;
+    float rotorRadius;
+    float thrustCoeff;
+    float rpm;
+    float yawAngle;
+    float pitchAngle;
+    float _pad0;
+};
+
+struct BladeAeroOutput
+{
+    float relativeWindSpeed;
+    float angleOfAttack;
+    float liftForce;
+    float dragForce;
+    float shearForceRoot;
+    float bendingMomentRoot;
+    float torque;
+    float sectionLoad[BLADE_SEGMENTS];
+    float sectionMoment[BLADE_SEGMENTS];
+};
+
+StructuredBuffer<TurbineInput> _Turbines;
+RWTexture2D<float2> _Velocity;
+int _TurbineCount;
+float _FreeStreamSpeed;
+float _AirDensity;
+float _Time;
+float _Rho;
+
+RWStructuredBuffer<BladeAeroOutput> _BladeAeroResults;
+
+RWTexture2D<float2> _BladeWindField;
+
+float2 SafeVelocity(float2 v)
+{
+    if (any(isnan(v)) || any(isinf(v)))
+        return float2(_FreeStreamSpeed, 0.0);
+    return v;
+}
+
+float2 SampleWindAt(float2 gridPos)
+{
+    int2 c = clamp(int2(gridPos), int2(0, 0), int2(N - 1, N - 1));
+    return SafeVelocity(_Velocity[c]);
+}
+
+float2 SampleWindBilinear(float2 gridPos)
+{
+    float2 p = clamp(gridPos, float2(0.5, 0.5), float2(N - 1.5, N - 1.5));
+    int2 p0 = int2(floor(p));
+    int2 p1 = p0 + int2(1, 1);
+    float2 f = p - floor(p);
+
+    float2 v00 = SafeVelocity(_Velocity[p0]);
+    float2 v10 = SafeVelocity(_Velocity[int2(p1.x, p0.y)]);
+    float2 v01 = SafeVelocity(_Velocity[int2(p0.x, p1.y)]);
+    float2 v11 = SafeVelocity(_Velocity[p1]);
+
+    return lerp(lerp(v00, v10, f.x), lerp(v01, v11, f.x), f.y);
+}
+
+[numthreads(THREADS, THREADS, 1)]
+void SampleTurbineWind(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= N || id.y >= N) return;
+    _BladeWindField[id.xy] = SafeVelocity(_Velocity[id.xy]);
+}
+
+[numthreads(MAX_TURBINES, 1, 1)]
+void ComputeBladeAerodynamics(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= _TurbineCount) return;
+
+    TurbineInput t = _Turbines[id.x];
+
+    float2 windDir = float2(cos(t.yawAngle), sin(t.yawAngle));
+    float2 crossDir = float2(-windDir.y, windDir.x);
+
+    float omega = t.rpm * 2.0 * 3.14159265 / 60.0;
+
+    float3 totalWind = float3(0, 0, 0);
+    float totalWeight = 0.0;
+
+    for (int r = 0; r < BLADE_SEGMENTS; r++)
+    {
+        float rFrac = (float(r) + 0.5) / float(BLADE_SEGMENTS);
+        float rLocal = rFrac * t.rotorRadius;
+
+        for (int theta = 0; theta < 8; theta++)
+        {
+            float thetaRad = (float(theta) / 8.0) * 2.0 * 3.14159265;
+            float2 bladeOffset = crossDir * rLocal * cos(thetaRad) + float2(0, 0);
+            float2 samplePos = t.gridPos + windDir * 0.2 + bladeOffset * 0.01;
+
+            float2 freeWind = SampleWindBilinear(samplePos);
+            float bladeSpeed = omega * rLocal;
+            float2 bladeVel = crossDir * bladeSpeed * cos(thetaRad);
+
+            float2 relWind = freeWind - bladeVel;
+
+            float w = 1.0;
+            totalWind += float3(relWind.x, relWind.y, 0) * w;
+            totalWeight += w;
+        }
+    }
+
+    float2 meanRelWind = totalWind.xy / max(totalWeight, 0.001);
+    float relSpeed = length(meanRelWind);
+    relSpeed = clamp(relSpeed, 0.1, _FreeStreamSpeed * 5.0);
+
+    float windAngle = atan2(meanRelWind.y, meanRelWind.x);
+    float sectionPitch = t.pitchAngle;
+    float AOA = sectionPitch - windAngle;
+    AOA = clamp(AOA, -0.5, 0.5);
+
+    float cl = 2.0 * 3.14159 * sin(AOA);
+    float cd = 0.01 + 0.05 * AOA * AOA;
+    float dynamicPressure = 0.5 * _AirDensity * relSpeed * relSpeed;
+
+    float areaBase = 0.03 * t.rotorRadius * t.rotorRadius / 3.0;
+
+    float totalLift = 0.0;
+    float totalDrag = 0.0;
+    float rootShear = 0.0;
+    float rootMoment = 0.0;
+    float totalTorque = 0.0;
+
+    for (int s = 0; s < BLADE_SEGMENTS; s++)
+    {
+        float sFrac = (float(s) + 0.5) / float(BLADE_SEGMENTS);
+        float rLocal = sFrac * t.rotorRadius;
+        float dr = t.rotorRadius / float(BLADE_SEGMENTS);
+
+        float chord = t.rotorRadius * 0.06 * (1.0 - 0.6 * sFrac);
+        float sectionArea = chord * dr;
+
+        float dynamicP = dynamicPressure * (0.5 + 0.5 * sFrac);
+
+        float secLift = cl * dynamicP * sectionArea;
+        float secDrag = cd * dynamicP * sectionArea;
+
+        secLift *= (1.0 - 0.3 * sFrac * sFrac);
+        secDrag *= (1.0 - 0.3 * sFrac * sFrac);
+
+        if (isnan(secLift) || isinf(secLift)) secLift = 0.0;
+        if (isnan(secDrag) || isinf(secDrag)) secDrag = 0.0;
+
+        totalLift += secLift;
+        totalDrag += secDrag;
+
+        float forcePerSpan = secLift / dr;
+        float dMoment = forcePerSpan * rLocal * dr;
+        rootMoment += dMoment;
+        rootShear += secLift;
+
+        float tangentialForce = secDrag + 0.1 * secLift * sin(AOA);
+        totalTorque += tangentialForce * rLocal;
+
+        _BladeAeroResults[id.x].sectionLoad[s] = forcePerSpan;
+        _BladeAeroResults[id.x].sectionMoment[s] = dMoment;
+    }
+
+    _BladeAeroResults[id.x].relativeWindSpeed = relSpeed;
+    _BladeAeroResults[id.x].angleOfAttack = AOA;
+    _BladeAeroResults[id.x].liftForce = totalLift;
+    _BladeAeroResults[id.x].dragForce = totalDrag;
+    _BladeAeroResults[id.x].shearForceRoot = rootShear;
+    _BladeAeroResults[id.x].bendingMomentRoot = rootMoment;
+    _BladeAeroResults[id.x].torque = totalTorque;
+}
