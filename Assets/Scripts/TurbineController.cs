@@ -8,16 +8,15 @@ public class TurbineController : MonoBehaviour
     public float hubHeight = 90f;
 
     [Header("Operational Parameters")]
-    [Range(0.0f, 1.0f)]
+    [Range(0.0f, 0.98f)]
     public float thrustCoefficient = 0.8f;
-    [Range(0.0f, 20.0f)]
+    [Range(0.0f, 30.0f)]
     public float targetRPM = 12.0f;
     [Range(0.0f, 360.0f)]
     public float yawAngleDegrees = 0.0f;
 
     [Header("Rotor Visual")]
     public Transform rotorBlade;
-    public float visualSpinSpeed = 30f;
 
     [Header("Runtime State")]
     public float currentRPM;
@@ -25,7 +24,6 @@ public class TurbineController : MonoBehaviour
     public float effectiveWindSpeed;
 
     private WindFieldManager _windManager;
-    private float _worldToGridScale;
     private float _smoothedRPM;
 
     public float yawAngle => yawAngleDegrees * Mathf.Deg2Rad;
@@ -43,6 +41,8 @@ public class TurbineController : MonoBehaviour
     {
         _windManager = FindObjectOfType<WindFieldManager>();
         _smoothedRPM = targetRPM;
+        currentRPM = targetRPM;
+        effectiveWindSpeed = 10f;
     }
 
     void Update()
@@ -53,24 +53,28 @@ public class TurbineController : MonoBehaviour
 
     void UpdateOperationalState()
     {
-        if (_windManager == null || _windManager.VelocityTexture == null) return;
+        if (_windManager != null)
+        {
+            effectiveWindSpeed = _windManager.freeStreamSpeed;
+        }
+        else
+        {
+            effectiveWindSpeed = 10f;
+        }
 
-        Vector2 gridPos = WorldToGrid(transform.position);
-        int gx = Mathf.Clamp((int)gridPos.x, 0, WindFieldManager.GRID_SIZE - 1);
-        int gy = Mathf.Clamp((int)gridPos.y, 0, WindFieldManager.GRID_SIZE - 1);
+        effectiveWindSpeed = Mathf.Clamp(effectiveWindSpeed, 0.1f, 50f);
 
-        RenderTexture velRT = _windManager.VelocityTexture;
-        RenderTexture.active = velRT;
-        Vector2 vel = new Vector2();
-        float[] pixels = new float[4];
-        velRT.GetPixelData<float>(0);
-        RenderTexture.active = null;
+        float optimalTSR = 7.0f;
+        float targetRPMFromWind = (optimalTSR * 60f * effectiveWindSpeed) / (Mathf.PI * Mathf.Max(rotorDiameter, 1f));
+        targetRPMFromWind = Mathf.Clamp(targetRPMFromWind, 0f, 30f);
 
-        effectiveWindSpeed = _windManager.freeStreamSpeed;
+        float blendTarget = Mathf.Min(targetRPM, targetRPMFromWind);
+        _smoothedRPM = Mathf.Lerp(_smoothedRPM, blendTarget, Time.deltaTime * 2f);
+        _smoothedRPM = Mathf.Clamp(_smoothedRPM, 0f, 30f);
+        currentRPM = _smoothedRPM;
 
         float tipSpeedRatio = (currentRPM * Mathf.PI * rotorDiameter) / (60f * effectiveWindSpeed + 0.001f);
 
-        float optimalTSR = 7.0f;
         float powerCoeff = 0.48f * Mathf.Exp(-0.5f * Mathf.Pow((tipSpeedRatio - optimalTSR) / 2.0f, 2f));
         powerCoeff = Mathf.Clamp(powerCoeff, 0f, 0.5926f);
 
@@ -78,10 +82,6 @@ public class TurbineController : MonoBehaviour
         float sweptArea = Mathf.PI * (rotorDiameter * 0.5f) * (rotorDiameter * 0.5f);
         currentPower = 0.5f * airDensity * sweptArea * Mathf.Pow(effectiveWindSpeed, 3f) * powerCoeff;
         currentPower = Mathf.Clamp(currentPower, 0f, ratedPower);
-
-        float targetRPMFromWind = (optimalTSR * 60f * effectiveWindSpeed) / (Mathf.PI * rotorDiameter);
-        _smoothedRPM = Mathf.Lerp(_smoothedRPM, Mathf.Min(targetRPM, targetRPMFromWind), Time.deltaTime * 2f);
-        currentRPM = _smoothedRPM;
     }
 
     void UpdateRotorVisual()
@@ -92,17 +92,8 @@ public class TurbineController : MonoBehaviour
         }
     }
 
-    Vector2 WorldToGrid(Vector3 worldPos)
-    {
-        float gridSize = 1000f;
-        float u = (worldPos.x / gridSize + 0.5f) * WindFieldManager.GRID_SIZE;
-        float v = (worldPos.z / gridSize + 0.5f) * WindFieldManager.GRID_SIZE;
-        return new Vector2(Mathf.Clamp(u, 0, WindFieldManager.GRID_SIZE - 1), Mathf.Clamp(v, 0, WindFieldManager.GRID_SIZE - 1));
-    }
-
     void OnDrawGizmosSelected()
     {
-        float gridSize = 1000f;
         float radiusWorld = rotorDiameter * 0.5f;
 
         Gizmos.color = Color.cyan;

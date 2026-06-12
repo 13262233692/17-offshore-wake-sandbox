@@ -5,6 +5,7 @@
 #define THREADS 16
 
 float _Dt;
+float _CFLDtScale;
 float _FreeStreamSpeed;
 float _AirDensity;
 
@@ -26,6 +27,23 @@ float _Time;
 RWTexture2D<float2> _Velocity;
 RWTexture2D<float> _Turbulence;
 
+float2 SafeVelocity(float2 v)
+{
+    if (any(isnan(v)) || any(isinf(v)))
+        return float2(_FreeStreamSpeed, 0.0);
+    float maxSpd = _FreeStreamSpeed * 3.0;
+    float speed = length(v);
+    if (speed > maxSpd)
+        v = v / speed * maxSpd;
+    return v;
+}
+
+float SafeTurbulence(float t)
+{
+    if (isnan(t) || isinf(t)) t = 0.0;
+    return clamp(t, 0.0, _FreeStreamSpeed * 2.0);
+}
+
 float2 Rotate2D(float2 v, float angle)
 {
     float s, c;
@@ -38,8 +56,12 @@ void ApplyTurbineSources(uint3 id : SV_DispatchThreadID)
 {
     if (id.x >= N || id.y >= N) return;
 
-    float2 vel = _Velocity[id.xy];
-    float turb = _Turbulence[id.xy];
+    float dt = _Dt * _CFLDtScale;
+
+    float2 vel = SafeVelocity(_Velocity[id.xy]);
+    float turb = SafeTurbulence(_Turbulence[id.xy]);
+
+    float maxVelChange = _FreeStreamSpeed * 0.3;
 
     for (int i = 0; i < _TurbineCount; i++)
     {
@@ -60,7 +82,8 @@ void ApplyTurbineSources(uint3 id : SV_DispatchThreadID)
         if (alongWind > -influenceUpstream && alongWind < influenceDownstream &&
             crossDist < lateralSpread)
         {
-            float a = 0.5 * (1.0 - sqrt(max(0.0, 1.0 - t.thrustCoeff)));
+            float ctClamped = clamp(t.thrustCoeff, 0.0, 0.98);
+            float a = 0.5 * (1.0 - sqrt(max(0.0001, 1.0 - ctClamped)));
 
             float longitudinalDecay = 1.0;
             if (alongWind > 0.0)
@@ -74,44 +97,68 @@ void ApplyTurbineSources(uint3 id : SV_DispatchThreadID)
                 longitudinalDecay = upstreamFrac * 0.3;
             }
 
-            float lateralDecay = exp(-crossDist * crossDist / (2.0 * lateralSpread * lateralSpread));
+            float lateralDecay = exp(-crossDist * crossDist / max(0.001, 2.0 * lateralSpread * lateralSpread));
 
             float wakeDeficit = 2.0 * a * longitudinalDecay * lateralDecay;
 
             float localSpeed = length(vel);
             float deficitAmount = wakeDeficit * _FreeStreamSpeed;
 
+            float dtScale = min(dt, maxVelChange / max(0.001, deficitAmount));
+
             if (localSpeed > 0.001)
             {
-                vel -= windDir * deficitAmount * _Dt;
+                float2 delta = windDir * deficitAmount * dtScale;
+                vel -= delta;
+
+                float minSpeed = _FreeStreamSpeed * 0.05;
+                if (length(vel) < minSpeed)
+                {
+                    float2 dir = length(vel) > 0.0001 ? normalize(vel) : windDir;
+                    vel = dir * minSpeed;
+                }
             }
 
             float turbulenceIntensity = 0.73 * a * (1.0 - a);
             float turbBase = turbulenceIntensity * longitudinalDecay * lateralDecay;
 
-            float turbPhase1 = _Time * t.rpm * 0.1 + float(id.x) * 0.05 + float(id.y) * 0.03;
-            float turbPhase2 = _Time * t.rpm * 0.07 + float(id.y) * 0.04 + float(id.x) * 0.02;
+            float phaseBase = _Time * clamp(t.rpm, 0.0, 30.0) * 0.1;
+            float turbPhase1 = phaseBase + float(id.x) * 0.05 + float(id.y) * 0.03;
+            float turbPhase2 = _Time * clamp(t.rpm, 0.0, 30.0) * 0.07 + float(id.y) * 0.04 + float(id.x) * 0.02;
+
+            float turbAmp = clamp(turbBase * _FreeStreamSpeed * 0.3, 0.0, maxVelChange);
             float2 turbFluctuation = float2(
                 sin(turbPhase1) * cos(turbPhase2 * 1.3),
                 cos(turbPhase1 * 0.8) * sin(turbPhase2)
-            ) * turbBase * _FreeStreamSpeed * 0.5;
+            ) * turbAmp;
 
-            vel += turbFluctuation * _Dt;
-            turb += turbBase * _Dt;
+            vel += turbFluctuation * dtScale;
+            turb += turbBase * dtScale;
         }
 
         float diskDist = length(toPoint);
         if (diskDist < diskRadiusPx * 0.8)
         {
-            float blockageStrength = 0.5 * a * (1.0 - diskDist / (diskRadiusPx * 0.8));
-            vel -= windDir * blockageStrength * _FreeStreamSpeed * _Dt;
+            float ctClamped = clamp(t.thrustCoeff, 0.0, 0.98);
+            float a = 0.5 * (1.0 - sqrt(max(0.0001, 1.0 - ctClamped)));
 
-            float tangentialSpeed = t.rpm * 2.0 * 3.14159 / 60.0 * t.rotorRadius * 0.01;
+            float blockageStrength = 0.5 * a * saturate(1.0 - diskDist / (diskRadiusPx * 0.8));
+            float blockageAmt = blockageStrength * _FreeStreamSpeed;
+            float dtScale = min(dt, maxVelChange / max(0.001, blockageAmt));
+
+            vel -= windDir * blockageAmt * dtScale;
+
+            float rpmSafe = clamp(t.rpm, 0.0, 30.0);
+            float tangentialSpeed = rpmSafe * 2.0 * 3.14159 / 60.0 * t.rotorRadius * 0.005;
+            tangentialSpeed = clamp(tangentialSpeed, -_FreeStreamSpeed * 0.5, _FreeStreamSpeed * 0.5);
             float2 tangent = float2(-windDir.y, windDir.x);
-            vel += tangent * tangentialSpeed * blockageStrength * _Dt;
-            turb += blockageStrength * 0.5 * _Dt;
+            vel += tangent * tangentialSpeed * blockageStrength * dtScale;
+            turb += blockageStrength * 0.5 * dtScale;
         }
     }
+
+    vel = SafeVelocity(vel);
+    turb = SafeTurbulence(turb);
 
     _Velocity[id.xy] = vel;
     _Turbulence[id.xy] = turb;

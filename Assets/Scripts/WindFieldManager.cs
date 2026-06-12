@@ -13,6 +13,12 @@ public class WindFieldManager : MonoBehaviour
     public float freeStreamSpeed = 10.0f;
     public float airDensity = 1.225f;
 
+    [Header("Stability Controls")]
+    public float cflSafetyFactor = 0.3f;
+    public int maxSubSteps = 8;
+    public bool useTiledPressureSolve = true;
+    public bool autoResetOnNaN = true;
+
     [Header("Compute Shaders")]
     public ComputeShader windSimulationShader;
     public ComputeShader turbineSourceShader;
@@ -33,13 +39,24 @@ public class WindFieldManager : MonoBehaviour
     private int _diffusionKernel;
     private int _divergenceKernel;
     private int _pressureKernel;
+    private int _pressureTiledKernel;
     private int _gradientSubtractKernel;
     private int _boundaryKernel;
     private int _copyKernel;
+    private int _clampKernel;
     private int _turbineSourceKernel;
 
     public RenderTexture VelocityTexture => _velocityRT;
     public RenderTexture TurbulenceTexture => _turbulenceRT;
+
+    [System.NonSerialized]
+    public int currentSubSteps;
+    [System.NonSerialized]
+    public float effectiveCFL;
+    [System.NonSerialized]
+    public bool isStable = true;
+    [System.NonSerialized]
+    public int nanResetCount;
 
     public struct TurbineGPUData
     {
@@ -94,9 +111,11 @@ public class WindFieldManager : MonoBehaviour
         _diffusionKernel = windSimulationShader.FindKernel("Diffusion");
         _divergenceKernel = windSimulationShader.FindKernel("ComputeDivergence");
         _pressureKernel = windSimulationShader.FindKernel("PressureSolve");
+        _pressureTiledKernel = windSimulationShader.FindKernel("PressureSolveTiled");
         _gradientSubtractKernel = windSimulationShader.FindKernel("PressureGradientSubtract");
         _boundaryKernel = windSimulationShader.FindKernel("ApplyBoundaryConditions");
         _copyKernel = windSimulationShader.FindKernel("CopyField");
+        _clampKernel = windSimulationShader.FindKernel("ClampAndSanitize");
 
         _turbineSourceKernel = turbineSourceShader.FindKernel("ApplyTurbineSources");
     }
@@ -108,25 +127,74 @@ public class WindFieldManager : MonoBehaviour
 
     void InitializeWindField()
     {
+        windSimulationShader.SetFloat("_FreeStreamSpeed", freeStreamSpeed);
+        windSimulationShader.SetFloat("_MaxVelocity", freeStreamSpeed * 3f);
+
         windSimulationShader.SetTexture(_boundaryKernel, "_Velocity", _velocityRT);
         windSimulationShader.SetTexture(_boundaryKernel, "_Pressure", _pressureRT);
         windSimulationShader.Dispatch(_boundaryKernel, THREAD_GROUPS, THREAD_GROUPS, 1);
 
-        SwapVelocity();
-        SwapPressure();
+        CopyVelocity();
+    }
+
+    float ComputeCFLDtScale()
+    {
+        float maxSpeedEstimate = freeStreamSpeed * 1.5f + 10f;
+        float invCellSize = 1f;
+        float cfl = maxSpeedEstimate * dt * invCellSize;
+        effectiveCFL = cfl;
+
+        if (cfl <= cflSafetyFactor)
+        {
+            currentSubSteps = 1;
+            return 1f;
+        }
+
+        int needed = Mathf.CeilToInt(cfl / cflSafetyFactor);
+        currentSubSteps = Mathf.Clamp(needed, 1, maxSubSteps);
+        return 1f / currentSubSteps;
     }
 
     void Update()
     {
+        if (autoResetOnNaN && CheckForNaN())
+        {
+            nanResetCount++;
+            Debug.LogWarning($"WindFieldManager: Detected NaN! Resetting simulation (count={nanResetCount})");
+            ResetSimulation();
+        }
+
         UpdateTurbineData();
 
-        ApplyTurbineSources();
-        Diffuse();
-        Advect();
-        Project();
-        ApplyBoundary();
+        float cflScale = ComputeCFLDtScale();
 
-        ClearTurbulenceDecay();
+        for (int step = 0; step < currentSubSteps; step++)
+        {
+            SetCommonParams(cflScale);
+
+            ApplyTurbineSources();
+            Diffuse();
+            Advect();
+            Project();
+            ApplyBoundary();
+            SanitizeAllFields();
+        }
+    }
+
+    void SetCommonParams(float cflScale)
+    {
+        windSimulationShader.SetFloat("_Dt", dt);
+        windSimulationShader.SetFloat("_CFLDtScale", cflScale);
+        windSimulationShader.SetFloat("_Viscosity", viscosity);
+        windSimulationShader.SetFloat("_Dissipation", dissipation);
+        windSimulationShader.SetFloat("_FreeStreamSpeed", freeStreamSpeed);
+        windSimulationShader.SetFloat("_MaxVelocity", freeStreamSpeed * 3f);
+        windSimulationShader.SetInt("_PressureIterations", pressureIterations);
+
+        turbineSourceShader.SetFloat("_Dt", dt);
+        turbineSourceShader.SetFloat("_CFLDtScale", cflScale);
+        turbineSourceShader.SetFloat("_FreeStreamSpeed", freeStreamSpeed);
+        turbineSourceShader.SetFloat("_AirDensity", airDensity);
     }
 
     void UpdateTurbineData()
@@ -169,9 +237,6 @@ public class WindFieldManager : MonoBehaviour
         turbineSourceShader.SetTexture(_turbineSourceKernel, "_Turbulence", _turbulenceRT);
         turbineSourceShader.SetBuffer(_turbineSourceKernel, "_Turbines", _turbineDataBuffer);
         turbineSourceShader.SetInt("_TurbineCount", turbines != null ? turbines.Length : 0);
-        turbineSourceShader.SetFloat("_Dt", dt);
-        turbineSourceShader.SetFloat("_FreeStreamSpeed", freeStreamSpeed);
-        turbineSourceShader.SetFloat("_AirDensity", airDensity);
         turbineSourceShader.SetFloat("_Time", Time.time);
         turbineSourceShader.Dispatch(_turbineSourceKernel, THREAD_GROUPS, THREAD_GROUPS, 1);
 
@@ -180,9 +245,6 @@ public class WindFieldManager : MonoBehaviour
 
     void Diffuse()
     {
-        windSimulationShader.SetFloat("_Viscosity", viscosity);
-        windSimulationShader.SetFloat("_Dt", dt);
-
         windSimulationShader.SetTexture(_diffusionKernel, "_Velocity", _velocityRT);
         windSimulationShader.SetTexture(_diffusionKernel, "_VelocityPrev", _velocityPrevRT);
         windSimulationShader.Dispatch(_diffusionKernel, THREAD_GROUPS, THREAD_GROUPS, 1);
@@ -192,10 +254,6 @@ public class WindFieldManager : MonoBehaviour
 
     void Advect()
     {
-        windSimulationShader.SetFloat("_Dt", dt);
-        windSimulationShader.SetFloat("_Dissipation", dissipation);
-        windSimulationShader.SetFloat("_InvGridSize", 1f / GRID_SIZE);
-
         windSimulationShader.SetTexture(_advectionKernel, "_Velocity", _velocityRT);
         windSimulationShader.SetTexture(_advectionKernel, "_VelocityPrev", _velocityPrevRT);
         windSimulationShader.Dispatch(_advectionKernel, THREAD_GROUPS, THREAD_GROUPS, 1);
@@ -212,12 +270,14 @@ public class WindFieldManager : MonoBehaviour
         ClearRT(_pressureRT);
         ClearRT(_pressurePrevRT);
 
+        int kernel = useTiledPressureSolve ? _pressureTiledKernel : _pressureKernel;
+
         for (int i = 0; i < pressureIterations; i++)
         {
-            windSimulationShader.SetTexture(_pressureKernel, "_Pressure", _pressureRT);
-            windSimulationShader.SetTexture(_pressureKernel, "_PressurePrev", _pressurePrevRT);
-            windSimulationShader.SetTexture(_pressureKernel, "_Divergence", _divergenceRT);
-            windSimulationShader.Dispatch(_pressureKernel, THREAD_GROUPS, THREAD_GROUPS, 1);
+            windSimulationShader.SetTexture(kernel, "_Pressure", _pressureRT);
+            windSimulationShader.SetTexture(kernel, "_PressurePrev", _pressurePrevRT);
+            windSimulationShader.SetTexture(kernel, "_Divergence", _divergenceRT);
+            windSimulationShader.Dispatch(kernel, THREAD_GROUPS, THREAD_GROUPS, 1);
 
             SwapPressure();
         }
@@ -234,12 +294,53 @@ public class WindFieldManager : MonoBehaviour
         windSimulationShader.Dispatch(_boundaryKernel, THREAD_GROUPS, THREAD_GROUPS, 1);
     }
 
-    void ClearTurbulenceDecay()
+    void SanitizeAllFields()
     {
-        RenderTexture tmp = RenderTexture.GetTemporary(GRID_SIZE, GRID_SIZE, 0, RenderTextureFormat.RFloat, RenderTextureReadWrite.Linear);
-        Graphics.Blit(_turbulenceRT, tmp);
-        Graphics.Blit(tmp, _turbulenceRT);
-        RenderTexture.ReleaseTemporary(tmp);
+        windSimulationShader.SetTexture(_clampKernel, "_Velocity", _velocityRT);
+        windSimulationShader.SetTexture(_clampKernel, "_Pressure", _pressureRT);
+        windSimulationShader.SetTexture(_clampKernel, "_Divergence", _divergenceRT);
+        windSimulationShader.Dispatch(_clampKernel, THREAD_GROUPS, THREAD_GROUPS, 1);
+    }
+
+    bool CheckForNaN()
+    {
+        try
+        {
+            RenderTexture prev = RenderTexture.active;
+            RenderTexture.active = _velocityRT;
+            Texture2D probe = new Texture2D(2, 2, TextureFormat.RGFloat, false);
+            probe.ReadPixels(new Rect(0, 0, 2, 2), 0, 0);
+            Color[] pixels = probe.GetPixels();
+            RenderTexture.active = prev;
+            Destroy(probe);
+
+            foreach (Color p in pixels)
+            {
+                if (float.IsNaN(p.r) || float.IsNaN(p.g) ||
+                    float.IsInfinity(p.r) || float.IsInfinity(p.g))
+                {
+                    isStable = false;
+                    return true;
+                }
+            }
+            isStable = true;
+            return false;
+        }
+        catch
+        {
+            return true;
+        }
+    }
+
+    void ResetSimulation()
+    {
+        ClearRT(_velocityRT);
+        ClearRT(_velocityPrevRT);
+        ClearRT(_pressureRT);
+        ClearRT(_pressurePrevRT);
+        ClearRT(_divergenceRT);
+        ClearRT(_turbulenceRT);
+        InitializeWindField();
     }
 
     void CopyVelocity()
